@@ -27,11 +27,16 @@ if uploaded_file and password:
         output_stream.seek(0)
 
         st.success("✅ PDF 已成功解鎖！")
-        st.download_button(
+        if st.download_button(
             label="下載解鎖後的 PDF",
             data=output_stream,
             file_name="unlocked.pdf",
             mime="application/pdf"
-        )
+        ):
+            # 下載完成後清空記憶體流
+            output_stream.close()
+            del output_stream
+            st.info("💡 PDF 已從記憶體中刪除。")
+            
     except Exception as e:
         st.error(f"❌ 解鎖失敗，請確認密碼是否正確。錯誤訊息: {e}")
