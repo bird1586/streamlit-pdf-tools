@@ -1,6 +1,8 @@
 import streamlit as st
 from PyPDF2 import PdfReader, PdfWriter
 from io import BytesIO
+from Crypto.Cipher import AES
+
 
 st.set_page_config(page_title="PDF 工具箱", page_icon="📂")
 
