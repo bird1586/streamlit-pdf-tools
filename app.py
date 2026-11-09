@@ -1,69 +1,11 @@
 import streamlit as st
 import pymupdf as fitz  # PyMuPDF
+from PIL import Image
+from streamlit_cropper import st_cropper
+
+import a4_layout as a4
 from PyPDF2 import PdfReader, PdfWriter
 from io import BytesIO
-
-
-# =========================
-# 裁切 + 合併至 A4 的輔助函式
-# =========================
-A4_W, A4_H = 595.0, 842.0  # pt
-
-
-def detect_content_rect(page, threshold=245, dpi=50):
-    """渲染成低解析度灰階圖，找出非白色內容的外框（回傳頁面座標 pt）。"""
-    pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
-    w, h, samples = pix.width, pix.height, pix.samples
-    x0, y0, x1, y1 = w, h, -1, -1
-    for y in range(h):
-        row = samples[y * w:(y + 1) * w]
-        if min(row) >= threshold:
-            continue
-        first = next(i for i, v in enumerate(row) if v < threshold)
-        last = w - 1 - next(i for i, v in enumerate(reversed(row)) if v < threshold)
-        x0, x1 = min(x0, first), max(x1, last)
-        y0 = min(y0, y)
-        y1 = y
-    if x1 < 0:  # 整頁空白
-        return page.rect
-    scale = 72 / dpi
-    return fitz.Rect(x0 * scale, y0 * scale, (x1 + 1) * scale, (y1 + 1) * scale)
-
-
-def crop_rect(page, auto, padding, margins):
-    """回傳要裁切的區域（頁面可見座標）。margins = (左, 上, 右, 下)。"""
-    if auto:
-        r = detect_content_rect(page) + (-padding, -padding, padding, padding)
-    else:
-        l, t, rt, b = margins
-        r = fitz.Rect(page.rect.x0 + l, page.rect.y0 + t, page.rect.x1 - rt, page.rect.y1 - b)
-    r = r & page.rect
-    return r if not r.is_empty else page.rect
-
-
-def build_a4(doc_a, doc_b, layout, outer_margin, gap, auto, padding, margins):
-    """A、B 逐頁配對，每一對輸出到同一張 A4。頁數不同時，較短者以空白補齊。"""
-    out = fitz.open()
-    inner_w, inner_h = A4_W - 2 * outer_margin, A4_H - 2 * outer_margin
-    if layout == "上下":
-        slot_h = (inner_h - gap) / 2
-        slots = [fitz.Rect(outer_margin, outer_margin, A4_W - outer_margin, outer_margin + slot_h),
-                 fitz.Rect(outer_margin, A4_H - outer_margin - slot_h, A4_W - outer_margin, A4_H - outer_margin)]
-    else:
-        slot_w = (inner_w - gap) / 2
-        slots = [fitz.Rect(outer_margin, outer_margin, outer_margin + slot_w, A4_H - outer_margin),
-                 fitz.Rect(A4_W - outer_margin - slot_w, outer_margin, A4_W - outer_margin, A4_H - outer_margin)]
-
-    for i in range(max(len(doc_a), len(doc_b))):
-        sheet = out.new_page(width=A4_W, height=A4_H)
-        for doc, slot in ((doc_a, slots[0]), (doc_b, slots[1])):
-            if i >= len(doc):
-                continue
-            page = doc[i]
-            clip = crop_rect(page, auto, padding, margins)
-            # clip 以「可見」座標計算，show_pdf_page 需要未旋轉座標
-            sheet.show_pdf_page(slot, doc, i, clip=clip * page.derotation_matrix, rotate=-page.rotation)
-    return out.tobytes(garbage=3, deflate=True)
 
 
 st.set_page_config(page_title="PDF 工具箱", page_icon="📂")
@@ -261,44 +203,156 @@ elif option == "✂️ PDF 擷取 / 重新排序":
 # 4. 裁切並合併至 A4
 # =========================
 elif option == "🖨️ 裁切並合併至 A4":
+    PREVIEW_DPI = 100
+    PX2PT = 72 / PREVIEW_DPI
+
+    @st.cache_data(show_spinner=False)
+    def page_image(pdf_bytes, pno):
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        return doc[pno].get_pixmap(dpi=PREVIEW_DPI).tobytes("png")
+
+    @st.cache_data(show_spinner=False)
+    def auto_rect(pdf_bytes, pno, padding):
+        page = fitz.open(stream=pdf_bytes, filetype="pdf")[pno]
+        r = a4.detect_content_rect(page) + (-padding, -padding, padding, padding)
+        r = r & page.rect
+        return tuple(r) if not r.is_empty else tuple(page.rect)
+
+    @st.cache_data(show_spinner="排版中…")
+    def do_pack(sizes, margin, gap, allow_rotate):
+        items = [a4.Item(0, i, fitz.Rect(0, 0, w, h)) for i, (w, h) in enumerate(sizes)]
+        a4.fit_scales(items, a4.A4_W - 2 * margin, a4.A4_H - 2 * margin)
+        sheets = a4.pack(items, margin, gap, allow_rotate)
+        return sheets
+
     st.header("🖨️ 裁切並合併至 A4")
-    st.write("將兩份 PDF 的內容區域裁切後，並排到同一張 A4（第 N 頁配第 N 頁），適合節省影印紙張。")
+    st.write("可上傳多份 PDF，逐頁拖曳框選要保留的內容。輸出時**維持原尺寸（不縮放）**，"
+             "自動旋轉並排版，用最少張 A4 印完。")
 
-    col1, col2 = st.columns(2)
-    file_a = col1.file_uploader("PDF A", type=["pdf"], key="a4_a")
-    file_b = col2.file_uploader("PDF B", type=["pdf"], key="a4_b")
+    files = st.file_uploader("上傳一個或多個 PDF", type=["pdf"], accept_multiple_files=True, key="a4_files")
+    if not files:
+        st.stop()
 
-    layout = st.radio("排版方式", ("上下", "左右"), horizontal=True)
-    crop_mode = st.radio("裁切方式", ("自動偵測內容範圍", "手動設定邊距"), horizontal=True)
-    auto = crop_mode == "自動偵測內容範圍"
-    padding, margins = 8, (0, 0, 0, 0)
-    if auto:
-        padding = st.slider("內容外留白 (pt)", 0, 50, 8)
-    else:
-        c = st.columns(4)
-        margins = tuple(c[i].number_input(n, 0, 500, 0) for i, n in enumerate(("左裁切", "上裁切", "右裁切", "下裁切")))
-    c1, c2 = st.columns(2)
-    outer_margin = c1.slider("A4 外邊距 (pt)", 0, 60, 20)
-    gap = c2.slider("兩份內容間距 (pt)", 0, 60, 20)
-
-    if file_a and file_b:
+    # ---- 讀取檔案 ----
+    srcs = []  # (file_id, name, bytes, page_count)
+    for f in files:
+        data = f.getvalue()
         try:
-            doc_a = fitz.open(stream=file_a.getvalue(), filetype="pdf")
-            doc_b = fitz.open(stream=file_b.getvalue(), filetype="pdf")
-            if doc_a.needs_pass or doc_b.needs_pass:
-                st.error("❌ 檔案有密碼保護，請先使用「PDF 解鎖」。")
+            d = fitz.open(stream=data, filetype="pdf")
+            if d.needs_pass:
+                st.error(f"❌ 「{f.name}」有密碼保護，請先使用「PDF 解鎖」。")
                 st.stop()
-
-            result = build_a4(doc_a, doc_b, layout, outer_margin, gap, auto, padding, margins)
-
-            st.success(f"✅ 已輸出，共 {max(len(doc_a), len(doc_b))} 張 A4！")
-            preview = fitz.open(stream=result, filetype="pdf")[0].get_pixmap(dpi=80).tobytes("png")
-            st.image(preview, caption="第 1 張預覽", width=360)
-            st.download_button(
-                label="下載 A4 合併 PDF",
-                data=result,
-                file_name="a4_combined.pdf",
-                mime="application/pdf"
-            )
+            srcs.append((f.file_id, f.name, data, len(d)))
         except Exception as e:
-            st.error(f"❌ 處理失敗，錯誤訊息: {e}")
+            st.error(f"❌ 無法讀取「{f.name}」：{e}")
+            st.stop()
+
+    ss = st.session_state
+    ss.setdefault("a4_crops", {})   # "fid:page" -> (x0, y0, x1, y1) pt，使用者手動調整過的裁切框
+    ss.setdefault("a4_skip", set())  # 不輸出的頁面
+    ss.setdefault("a4_ver", 0)       # 批次操作後遞增，讓裁切元件重建
+    ss.setdefault("a4_init", {})
+
+    with st.expander("⚙️ 設定", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        padding = c1.slider("自動偵測：內容外留白 (pt)", 0, 50, 8)
+        margin = c2.slider("A4 外邊距 (pt)", 0, 60, 20)
+        gap = c3.slider("區塊間距 (pt)", 0, 40, 6)
+        allow_rotate = st.checkbox("允許自動旋轉 90° 以節省空間", value=True)
+        draw_border = st.checkbox("畫出虛線框線（方便剪下）", value=True)
+
+    def key_of(fi, pno):
+        return f"{srcs[fi][0]}:{pno}"
+
+    def current_rect(fi, pno):
+        return ss.a4_crops.get(key_of(fi, pno)) or auto_rect(srcs[fi][2], pno, padding)
+
+    # ---- 逐頁裁切 ----
+    st.subheader("① 裁切")
+    labels = [f"{name}（{n} 頁）" for _, name, _, n in srcs]
+    fi = labels.index(st.selectbox("選擇 PDF", labels)) if len(srcs) > 1 else 0
+    n_pages = srcs[fi][3]
+    pno = (st.number_input("頁碼", 1, n_pages, 1) - 1) if n_pages > 1 else 0
+    k = key_of(fi, pno)
+    pdf_bytes = srcs[fi][2]
+
+    img = Image.open(BytesIO(page_image(pdf_bytes, pno)))
+    init = ss.a4_init.setdefault((k, ss.a4_ver, padding), current_rect(fi, pno))
+    coords = (int(init[0] / PX2PT), int(init[2] / PX2PT), int(init[1] / PX2PT), int(init[3] / PX2PT))  # (xl, xr, yt, yb)
+
+    st.caption("拖曳藍框移動、拉邊角調整大小；框內即為保留範圍。")
+    box = st_cropper(img, realtime_update=True, default_coords=coords, box_color="#1f77ff",
+                     return_type="box", key=f"crop_{k}_{ss.a4_ver}_{padding}")
+    page_rect = fitz.Rect(0, 0, img.width * PX2PT, img.height * PX2PT)
+    rect = fitz.Rect(box["left"] * PX2PT, box["top"] * PX2PT,
+                     (box["left"] + box["width"]) * PX2PT, (box["top"] + box["height"]) * PX2PT) & page_rect
+    if rect.is_empty or rect.width < 5 or rect.height < 5:
+        rect = fitz.Rect(*current_rect(fi, pno))
+    rect_t = tuple(round(v, 1) for v in rect)
+    if rect_t != tuple(round(v, 1) for v in current_rect(fi, pno)):
+        ss.a4_crops[k] = rect_t
+
+    st.write(f"此頁裁切尺寸：**{rect.width / a4.PT_PER_MM:.0f} × {rect.height / a4.PT_PER_MM:.0f} mm**")
+    include = st.checkbox("輸出此頁", value=k not in ss.a4_skip, key=f"inc_{k}_{ss.a4_ver}")
+    if include:
+        ss.a4_skip.discard(k)
+    else:
+        ss.a4_skip.add(k)
+
+    b1, b2, b3 = st.columns(3)
+    if b1.button("🔄 此頁重設為自動偵測"):
+        ss.a4_crops.pop(k, None)
+        ss.a4_ver += 1
+        st.rerun()
+    if b2.button("📋 套用此框到本 PDF 全部頁"):
+        for p in range(n_pages):
+            ss.a4_crops[key_of(fi, p)] = rect_t
+        ss.a4_ver += 1
+        st.rerun()
+    if b3.button("⚡ 全部頁面重設為自動偵測"):
+        ss.a4_crops.clear()
+        ss.a4_ver += 1
+        st.rerun()
+
+    # ---- 排版 ----
+    st.subheader("② 排版結果")
+    entries = [(i, p) for i, s in enumerate(srcs) for p in range(s[3]) if key_of(i, p) not in ss.a4_skip]
+    if not entries:
+        st.warning("沒有要輸出的頁面。")
+        st.stop()
+    sizes = []
+    for i, p in entries:
+        r = fitz.Rect(*current_rect(i, p))
+        sizes.append((round(r.width, 1), round(r.height, 1)))
+
+    try:
+        sheets = do_pack(tuple(sizes), margin, gap, allow_rotate)
+    except Exception as e:
+        st.error(f"❌ 排版失敗：{e}")
+        st.stop()
+    items_preview = [a4.Item(0, j, fitz.Rect(0, 0, w, h)) for j, (w, h) in enumerate(sizes)]
+    shrunk = a4.fit_scales(items_preview, a4.A4_W - 2 * margin, a4.A4_H - 2 * margin)
+    stt = a4.stats(items_preview, sheets, margin)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("輸出頁面數", stt["items"])
+    m2.metric("A4 張數", stt["sheets"], delta=f"省 {stt['items'] - stt['sheets']} 張", delta_color="normal")
+    m3.metric("版面利用率", f"{stt['utilization']:.0%}")
+    if shrunk:
+        names = "、".join(f"{srcs[entries[j][0]][1]} 第{entries[j][1] + 1}頁" for j in shrunk)
+        st.warning(f"⚠️ 以下裁切區塊比一張 A4 還大，已等比縮小至剛好放進一張：{names}")
+
+    # ---- 輸出 ----
+    docs = [fitz.open(stream=s[2], filetype="pdf") for s in srcs]
+    items = []
+    for (i, p), j in zip(entries, range(len(entries))):
+        items.append(a4.Item(i, p, fitz.Rect(*current_rect(i, p))))
+    a4.fit_scales(items, a4.A4_W - 2 * margin, a4.A4_H - 2 * margin)
+    result = a4.render(docs, items, sheets, draw_border)
+
+    prev = fitz.open(stream=result, filetype="pdf")
+    cols = st.columns(min(len(prev), 3))
+    for n, pg in enumerate(prev):
+        cols[n % len(cols)].image(pg.get_pixmap(dpi=60).tobytes("png"), caption=f"第 {n + 1} 張")
+
+    st.download_button("⬇️ 下載 A4 PDF", result, "a4_combined.pdf", "application/pdf", type="primary")

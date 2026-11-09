@@ -1,3 +1,5 @@
 PyPDF2
 pycryptodome
 pymupdf
+streamlit-cropper
+rectpack
